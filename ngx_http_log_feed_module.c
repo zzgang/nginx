@@ -18,6 +18,7 @@
 #define FEED_LOG_FNAME_PADDING_TEMPLATE "_"FEED_LOG_DATE_PADDING_STR"_"FEED_LOG_FNAME_UNIQ_DUMMY_STR".log"
 #define LOG_HOST_DIR 1
 #define MAX_FEED_LOG_FILE_NUM (1<<10)
+#define MAX_FEED_LOG_FILE_SPACE (MAX_FEED_LOG_FILE_NUM + 1)
 #define MAX_FEED_LOG_FILE_SIZE (1<<26)
 #define MAX_FEED_LOG_FNAME_LEN 256
 #define FEED_LOG_UNLIKED_FILE -1
@@ -95,12 +96,16 @@ typedef struct {
 } feed_tstr_t;
 
 typedef struct feed_log_file_s{
-    feed_fstr_t ffname;   //full file name.
+    feed_fstr_t ffname; /*full file name*/
+
     uint64_t file_size;
     uint64_t write_len;
+
     feed_tstr_t create_date;
-    ngx_int_t in_use;
-    ngx_atomic_t uc;
+
+    ngx_int_t in_use; /*in servising*/
+    uint64_t uc_stat; /*use count stats*/
+    ngx_atomic_t ref_count; /*opening reference counts by processes*/
 
     struct feed_log_file_s *free_next;
 
@@ -119,7 +124,7 @@ typedef struct {
     ngx_shmtx_sh_t shmtx_addr;
     feed_log_file_t *hash_table[MAX_FEED_LOG_FILE_NUM];
     feed_log_file_t *free_list;
-    feed_log_file_t feed_log_files[MAX_FEED_LOG_FILE_NUM];
+    feed_log_file_t feed_log_files[MAX_FEED_LOG_FILE_SPACE];
 } feed_log_file_summary_shm_t;
 
 typedef struct {
@@ -139,7 +144,7 @@ typedef struct {
 
 typedef struct {
     ngx_str_t buf;
-    size_t size; //preallocate mem size.
+    size_t size; //pre-allocate mem size.
 } feed_log_line_t;
 
 typedef struct {
@@ -170,7 +175,7 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
         ngx_str_t *fname, 
         feed_log_shm_t *shm, 
         ngx_http_request_t *r);
-#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->uc, -1)
+#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->ref_count, -1)
 
 static ngx_int_t feed_log_get_id(u_char *feed_id, ngx_http_request_t *r);
 
@@ -211,7 +216,7 @@ static feed_log_line_var_t *feed_log_line_vps[sizeof(feed_log_line_vars)] = {NUL
 static struct {
      ngx_fd_t fd;                   //open fd in current process.
      feed_fstr_t ffname;            //opened full file name.
-} cached_files[MAX_FEED_LOG_FILE_NUM];
+} cached_files[MAX_FEED_LOG_FILE_SPACE];
 
 static ngx_command_t  ngx_http_log_feed_commands[] = {
     { 
@@ -490,7 +495,7 @@ get_repeat:
     if (feed_log_p != NULL) {
         feed_log_p->write_len = write_len;
         if (feed_log_check_file(feed_log_p, r) == FEED_LOG_UNLIKED_FILE) {
-            if (feed_log_p->uc != 0) {
+            if (feed_log_p->ref_count != 0) {
                 ngx_shmtx_unlock(&shm->shmtx);
                 goto get_repeat;
             } 
@@ -504,21 +509,52 @@ get_repeat:
     }
 
 create_newfile:
-    //get free feed log file.
-    feed_log_p = FLG->free_list; 
-    while (feed_log_p->free_next != FLG->free_list) {
-        if (feed_log_p->in_use == 0) {
-            break;
+    {
+        //Get free feed log file.
+        typeof(*feed_log_p) *p, *free_feed_log_p = NULL;
+        uint64_t uc = ~0;
+        
+        p = FLG->free_list; 
+        while (p->free_next != FLG->free_list) {
+            if (p->in_use == 0) {
+                free_feed_log_p = p;
+                FLG->free_list = p->free_next;
+                break;
+            }
+            
+            if (p->uc_stat < uc && p->ref_count == 0) {
+                uc = p->uc_stat;
+                free_feed_log_p = p;
+            }
+
+            p = p->free_next;
         }
-        feed_log_p = feed_log_p->free_next;
+
+        if (!free_feed_log_p) {
+
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
+                    "Serving feed log files exceeds max feed files limit: %d, please consider to raise the feed log files limit;", 
+                    MAX_FEED_LOG_FILE_NUM);
+
+            goto out_unlock_err;
+
+        }
+
+        //LRU
+        if (free_feed_log_p->in_use != 0) {
+            ngx_str_t free_fname = {
+                .data = free_feed_log_p->ffname.data,
+                .len = free_feed_log_p->ffname.len - sizeof(FEED_LOG_FNAME_PADDING_TEMPLATE)
+            };
+            free_feed_log_p->in_use = 0;
+            free_feed_log_p->uc_stat = 0;
+            hash = _hashfn(&free_fname) % MAX_FEED_LOG_FILE_NUM;
+            FEED_LOG_HASH_REMOVE(FLG->hash_table[hash], free_feed_log_p);
+        }
+
+        feed_log_p = free_feed_log_p;
     }
 
-    if (feed_log_p->in_use != 0) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                "Serving feed log files exceeds max feed files limit: %d!", 
-                MAX_FEED_LOG_FILE_NUM);
-        goto out_unlock_err;
-    }
 
     if (feed_log_create_newfile(fname, feed_log_p, r) == NGX_OK) {
         feed_log_p->in_use = 1;
@@ -558,7 +594,8 @@ found:
     }
 
 out_unlock_ok:
-    feed_log_p->uc++;
+    feed_log_p->ref_count++;
+    feed_log_p->uc_stat++;
     ngx_shmtx_unlock(&shm->shmtx);
     fp->fd = current_cached_file->fd;
     fp->flp = feed_log_p;
@@ -574,11 +611,9 @@ static void feed_log_sshm_init(feed_log_file_summary_shm_t *sshm)
 {
     ngx_int_t i;
 
-    for (i = 0;i < MAX_FEED_LOG_FILE_NUM - 1; i++) {
-        sshm->feed_log_files[i].in_use = 0;
+    for (i = 0;i < MAX_FEED_LOG_FILE_SPACE; i++) {
         sshm->feed_log_files[i].free_next = &sshm->feed_log_files[i+1];
     }
-    sshm->feed_log_files[i].in_use = 0;
     sshm->feed_log_files[i].free_next = sshm->feed_log_files;
 
     sshm->free_list = sshm->feed_log_files;
@@ -623,7 +658,7 @@ static ngx_int_t ngx_http_log_feed_module_init(ngx_cycle_t *cycle)
     //init cached files by master to each process
     {
         ngx_int_t i;
-        for(i = 0; i < MAX_FEED_LOG_FILE_NUM; i++) {
+        for(i = 0; i < MAX_FEED_LOG_FILE_SPACE; i++) {
             cached_files[i].fd = -1;
         }
     }
