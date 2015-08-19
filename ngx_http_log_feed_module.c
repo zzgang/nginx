@@ -103,7 +103,7 @@ typedef struct feed_log_file_s{
 
     feed_tstr_t create_date;
 
-    ngx_int_t in_use; /*in servising*/
+    ngx_int_t in_use; /*if in servising*/
     uint64_t uc_stat; /*use count stats*/
     ngx_atomic_t ref_count; /*opening reference counts by processes*/
 
