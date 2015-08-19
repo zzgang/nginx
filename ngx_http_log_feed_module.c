@@ -196,9 +196,9 @@ static feed_log_line_var_t feed_log_line_vars[] = {
     FEED_LOG_LINE_VAR_ENTRY(status),
     FEED_LOG_LINE_VAR_ENTRY(cookies),
     FEED_LOG_LINE_VAR_ENTRY(user_agent),
-    FEED_LOG_LINE_VAR_ARG_ENTRY(host, "WF.host"),
-    FEED_LOG_LINE_VAR_ARG_ENTRY(request, "WF.request"),
-    FEED_LOG_LINE_VAR_ARG_ENTRY(referer, "WF.referer"), 
+    FEED_LOG_LINE_VAR_ARG_ENTRY(host, "VA.url"),
+    FEED_LOG_LINE_VAR_ARG_ENTRY(request, "VA.request"),
+    FEED_LOG_LINE_VAR_ARG_ENTRY(referer, "VA.referer"), 
     FEED_LOG_LINE_VAR_ENTRY(args), //must be last
     FEED_LOG_LINE_VAR_NULL
 };
