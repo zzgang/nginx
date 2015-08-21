@@ -10,7 +10,7 @@
 
 #define DEFAULT_FEED_LOG_ROOT "feed"
 #define DEFAULT_FEED_LOG_FNAME "feed"
-#define FEED_LOG_FILE_LOCK "feed_lock"
+#define FEED_LOG_FILE_LOCK ".feed_lock"
 #define FEED_LOG_FNAME_UNIQ_DUMMY_STR "XXXXXX"
 #define FEED_LOG_DATE_PADDING_STR "YYYY_MM_DD_hHH"
 #define FEED_LOG_DATE_FMT_STR "%4d_%02d_%02d_h%02d"
@@ -110,7 +110,7 @@ typedef struct feed_log_file_s{
 
 typedef struct {
     ngx_fd_t fd;
-    feed_fstr_t *ffp;
+    feed_log_file_t *flp;
 } feed_log_file_ex_t;
 
 
@@ -163,11 +163,13 @@ static void ngx_http_log_feed_module_exit(ngx_cycle_t *cycle);
 static ngx_int_t feed_log_create_newfile(ngx_str_t *fname, 
         feed_log_file_t *feed_log_p, 
         ngx_http_request_t *r);
+
 static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
         ngx_int_t write_len,
         ngx_str_t *fname, 
         feed_log_shm_t *shm, 
         ngx_http_request_t *r);
+#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->in_use, -1)
 
 static ngx_int_t feed_log_get_id(u_char *feed_id, ngx_http_request_t *r);
 
@@ -273,7 +275,7 @@ static inline ngx_uint_t _hashfn(ngx_str_t *str)
 {
     ngx_uint_t i, hash = 0;
 
-    for (i= 0;i < str->len; i++) {
+    for (i = 0; i < str->len; i++) {
         hash = (hash << 5) + (ngx_uint_t)str->data[i];
     }
 
@@ -369,14 +371,14 @@ static inline ngx_int_t feed_log_write_file(feed_log_file_ex_t *fp,
 
     do {
         ret = write(fp->fd, (const char *)buf, count);
-    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+    } while (ret == -1 && (ngx_errno == EINTR || ngx_errno == EAGAIN));
 
     if (ret == -1) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno, 
-                "Write file %s error: %s!", fp->ffp->data);
+                "Write file %s error: %s!", fp->flp->ffname.data);
         if (ngx_close_file(fp->fd) == NGX_FILE_ERROR) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno, 
-                    "Close file %s failed!", fp->ffp->data);
+                    "Close file %s failed!", fp->flp->ffname.data);
         }
         return NGX_ERROR;
     } 
@@ -412,7 +414,7 @@ static ngx_int_t feed_log_create_newfile(ngx_str_t *fname,
     uniq_str.len = sizeof(FEED_LOG_FNAME_UNIQ_DUMMY_STR) - 1;
     uniq_str.data = ngx_pcalloc(r->pool, uniq_str.len + 1);
     if (uniq_str.data == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "No more memory!");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno, "No more memory!");
         return NGX_ERROR;
     }
     ngx_memcpy(uniq_str.data, FEED_LOG_FNAME_UNIQ_DUMMY_STR, 
@@ -448,7 +450,7 @@ repeat:
     {
         feed_log_file_ex_t flf;
         flf.fd = fd;
-        flf.ffp = &feed_log_p->ffname;
+        flf.flp = feed_log_p;
         if (feed_log_write_file(&flf, feed_log_init_msg.data, feed_log_init_msg.len, r)
                 != NGX_OK) {
             return NGX_ERROR;
@@ -481,13 +483,17 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
     ngx_int_t current_cached_file_idx;
     typeof(cached_files[0]) *current_cached_file;
 
-    ngx_shmtx_lock(&shm->shmtx);
+get_repeat:
 
+    ngx_shmtx_lock(&shm->shmtx);
     feed_log_p = FEED_LOG_HASH_FIND(FLG->hash_table[hash], fname);
     if (feed_log_p != NULL) {
         feed_log_p->write_len = write_len;
         if (feed_log_check_file(feed_log_p, r) == FEED_LOG_UNLIKED_FILE) {
-            feed_log_p->in_use = 0;  
+            if (feed_log_p->in_use != 0) {
+                ngx_shmtx_unlock(&shm->shmtx);
+                goto get_repeat;
+            } 
             FLG->free_list = feed_log_p;
             FEED_LOG_HASH_REMOVE(FLG->hash_table[hash], feed_log_p);
             goto create_newfile;
@@ -515,7 +521,6 @@ create_newfile:
 
     if (feed_log_create_newfile(fname, feed_log_p, r) == NGX_OK) {
         FEED_LOG_HASH_ADD(FLG->hash_table[hash], feed_log_p);
-        feed_log_p->in_use = 1;
     } else {
         goto out_unlock_err;
     }
@@ -523,11 +528,11 @@ create_newfile:
 found:
     feed_log_p->file_size += write_len;
     current_cached_file_idx = ((u_char *)feed_log_p - (u_char *)FLG->feed_log_files)/(sizeof(*feed_log_p));
-   current_cached_file = cached_files + current_cached_file_idx;
+    current_cached_file = cached_files + current_cached_file_idx;
 
     if (current_cached_file->fd >= 0) {
         if ((current_cached_file->ffname.len == feed_log_p->ffname.len) && ngx_strncmp(current_cached_file->ffname.data, feed_log_p->ffname.data, current_cached_file->ffname.len) == 0) {
-            goto out_cached;
+            goto out_unlock_ok;
         } else {
             if (ngx_close_file(current_cached_file->fd) == NGX_FILE_ERROR) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno, 
@@ -550,16 +555,18 @@ found:
         ngx_memcpy(current_cached_file->ffname.data, feed_log_p->ffname.data, feed_log_p->ffname.len); 
     }
 
-out_cached:
+out_unlock_ok:
+    feed_log_p->in_use++;
     ngx_shmtx_unlock(&shm->shmtx);
     fp->fd = current_cached_file->fd;
-    fp->ffp = &feed_log_p->ffname;
+    fp->flp = feed_log_p;
     return NGX_OK;
 
 out_unlock_err:
     ngx_shmtx_unlock(&shm->shmtx);
     return NGX_ERROR;
 }
+
 
 static void feed_log_sshm_init(feed_log_file_summary_shm_t *sshm)
 {
@@ -597,7 +604,6 @@ static ngx_int_t feed_log_shm_init(feed_log_shm_t *fl_shm)
     ngx_memzero(fl_shm->addr, fl_shm->shm.size);
     if (ngx_shmtx_create(&fl_shm->shmtx, &fl_shm->addr->shmtx_addr,
                 (u_char *)FEED_LOG_FILE_LOCK) != NGX_OK) {
-
         return NGX_ERROR;
     }
     
@@ -648,7 +654,7 @@ static ngx_int_t feed_log_get_id(u_char *feed_id, ngx_http_request_t *r)
 
     uniq_str.data = ngx_pcalloc(r->pool, 128);
     if (uniq_str.data == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "No more memory!");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno, "No more memory!");
         return NGX_ERROR;
     }
     uniq_str.len = ngx_sprintf(uniq_str.data, (const char *)uniq_str_fmt, 
@@ -1280,6 +1286,7 @@ dir_exists:
     //get and write file. 
     {
         feed_log_file_ex_t flf;
+
         if (feed_log_get_file(&flf, line.buf.len, &feed_fname, &feed_log_shm, r) 
                 != NGX_OK) {
             return NGX_ERROR;
@@ -1287,8 +1294,11 @@ dir_exists:
 
         if (feed_log_write_file(&flf, line.buf.data, line.buf.len, r) 
                 != NGX_OK) {
+            feed_log_put_file(&flf);
             return NGX_ERROR;
         }
+
+        feed_log_put_file(&flf);
     }
 
     return NGX_OK;
@@ -1383,7 +1393,7 @@ found:
         lfcf->log_root_dir.len = lfcf->log_root.len + 1; //prespace for '/'
         lfcf->log_root_dir.data = ngx_pcalloc(cf->pool, lfcf->log_root_dir.len+1); //padding '\0' 
         if (lfcf->log_root_dir.data == NULL) {
-            ngx_log_error(NGX_LOG_ERR, cf->log, 0, "No more memory!");
+            ngx_log_error(NGX_LOG_ERR, cf->log, ngx_errno, "No more memory!");
             return NGX_CONF_ERROR;
         }
         ngx_memcpy(lfcf->log_root_dir.data, lfcf->log_root.data, lfcf->log_root.len);
@@ -1403,7 +1413,7 @@ found:
         len = cf->cycle->prefix.len + lfcf->log_root_dir.len;
         dir_str = ngx_pcalloc(cf->pool, len+1);  //padding '\0'
         if (dir_str == NULL) {
-            ngx_log_error(NGX_LOG_ERR, cf->log, 0, "No more memory!");
+            ngx_log_error(NGX_LOG_ERR, cf->log, ngx_errno, "No more memory!");
             return NGX_CONF_ERROR;
         }
 
