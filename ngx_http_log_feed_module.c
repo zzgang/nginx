@@ -100,6 +100,7 @@ typedef struct feed_log_file_s{
     uint64_t write_len;
     feed_tstr_t create_date;
     ngx_int_t in_use;
+    ngx_atomic_t uc;
 
     struct feed_log_file_s *free_next;
 
@@ -169,7 +170,7 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
         ngx_str_t *fname, 
         feed_log_shm_t *shm, 
         ngx_http_request_t *r);
-#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->in_use, -1)
+#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->uc, -1)
 
 static ngx_int_t feed_log_get_id(u_char *feed_id, ngx_http_request_t *r);
 
@@ -276,7 +277,7 @@ static inline ngx_uint_t _hashfn(ngx_str_t *str)
     ngx_uint_t i, hash = 0;
 
     for (i = 0; i < str->len; i++) {
-        hash = (hash << 5) + (ngx_uint_t)str->data[i];
+        hash = ((hash << 5) + hash) + (ngx_uint_t)str->data[i];
     }
 
     return hash;
@@ -484,16 +485,16 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
     typeof(cached_files[0]) *current_cached_file;
 
 get_repeat:
-
     ngx_shmtx_lock(&shm->shmtx);
     feed_log_p = FEED_LOG_HASH_FIND(FLG->hash_table[hash], fname);
     if (feed_log_p != NULL) {
         feed_log_p->write_len = write_len;
         if (feed_log_check_file(feed_log_p, r) == FEED_LOG_UNLIKED_FILE) {
-            if (feed_log_p->in_use != 0) {
+            if (feed_log_p->uc != 0) {
                 ngx_shmtx_unlock(&shm->shmtx);
                 goto get_repeat;
             } 
+            feed_log_p->in_use = 0;
             FLG->free_list = feed_log_p;
             FEED_LOG_HASH_REMOVE(FLG->hash_table[hash], feed_log_p);
             goto create_newfile;
@@ -520,6 +521,7 @@ create_newfile:
     }
 
     if (feed_log_create_newfile(fname, feed_log_p, r) == NGX_OK) {
+        feed_log_p->in_use = 1;
         FEED_LOG_HASH_ADD(FLG->hash_table[hash], feed_log_p);
     } else {
         goto out_unlock_err;
@@ -556,7 +558,7 @@ found:
     }
 
 out_unlock_ok:
-    feed_log_p->in_use++;
+    feed_log_p->uc++;
     ngx_shmtx_unlock(&shm->shmtx);
     fp->fd = current_cached_file->fd;
     fp->flp = feed_log_p;
