@@ -105,7 +105,7 @@ typedef struct feed_log_file_s{
 
     ngx_int_t in_use; /*if in servising*/
     uint64_t uc_stat; /*use count stats*/
-    ngx_atomic_t ref_count; /*opening reference counts by processes*/
+    ngx_uint_t ref_count; /*opening reference counts by processes*/
 
     struct feed_log_file_s *free_next;
 
@@ -121,15 +121,19 @@ typedef struct {
 
 
 typedef struct {
+    //mutex 
     ngx_shmtx_sh_t shmtx_addr;
+    ngx_shmtx_t shmtx;
+
     feed_log_file_t *hash_table[MAX_FEED_LOG_FILE_NUM];
     feed_log_file_t *free_list;
     feed_log_file_t feed_log_files[MAX_FEED_LOG_FILE_SPACE];
+
 } feed_log_file_summary_shm_t;
 
 typedef struct {
     ngx_shm_t shm;
-    ngx_shmtx_t shmtx;
+    ngx_shmtx_t *shmtx_ptr;
     feed_log_file_summary_shm_t *addr;
 } feed_log_shm_t;
 
@@ -175,7 +179,12 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
         ngx_str_t *fname, 
         feed_log_shm_t *shm, 
         ngx_http_request_t *r);
-#define feed_log_put_file(fp) ngx_atomic_fetch_add(&(fp)->flp->ref_count, -1)
+static inline void feed_log_put_file(feed_log_file_ex_t *fp, feed_log_shm_t *shm) 
+{
+    ngx_shmtx_lock(shm->shmtx_ptr); 
+    --fp->flp->ref_count;
+    ngx_shmtx_unlock(shm->shmtx_ptr);
+}
 
 static ngx_int_t feed_log_get_id(u_char *feed_id, ngx_http_request_t *r);
 
@@ -490,13 +499,16 @@ static ngx_int_t feed_log_get_file(feed_log_file_ex_t *fp,
     typeof(cached_files[0]) *current_cached_file;
 
 get_repeat:
-    ngx_shmtx_lock(&shm->shmtx);
+    ngx_shmtx_lock(shm->shmtx_ptr);
+    
     feed_log_p = FEED_LOG_HASH_FIND(FLG->hash_table[hash], fname);
+
     if (feed_log_p != NULL) {
         feed_log_p->write_len = write_len;
         if (feed_log_check_file(feed_log_p, r) == FEED_LOG_UNLIKED_FILE) {
             if (feed_log_p->ref_count != 0) {
-                ngx_shmtx_unlock(&shm->shmtx);
+                ngx_shmtx_unlock(shm->shmtx_ptr);
+                ngx_msleep(1000);
                 goto get_repeat;
             } 
             feed_log_p->in_use = 0;
@@ -544,7 +556,7 @@ create_newfile:
         if (free_feed_log_p->in_use != 0) {
             ngx_str_t free_fname = {
                 .data = free_feed_log_p->ffname.data,
-                .len = free_feed_log_p->ffname.len - sizeof(FEED_LOG_FNAME_PADDING_TEMPLATE)
+                .len = free_feed_log_p->ffname.len - (sizeof(FEED_LOG_FNAME_PADDING_TEMPLATE - 1))
             };
             free_feed_log_p->in_use = 0;
             free_feed_log_p->uc_stat = 0;
@@ -594,15 +606,15 @@ found:
     }
 
 out_unlock_ok:
-    feed_log_p->ref_count++;
-    feed_log_p->uc_stat++;
-    ngx_shmtx_unlock(&shm->shmtx);
+    ++feed_log_p->ref_count;
+    ++feed_log_p->uc_stat;
+    ngx_shmtx_unlock(shm->shmtx_ptr);
     fp->fd = current_cached_file->fd;
     fp->flp = feed_log_p;
     return NGX_OK;
 
 out_unlock_err:
-    ngx_shmtx_unlock(&shm->shmtx);
+    ngx_shmtx_unlock(shm->shmtx_ptr);
     return NGX_ERROR;
 }
 
@@ -621,7 +633,7 @@ static void feed_log_sshm_init(feed_log_file_summary_shm_t *sshm)
 
 static inline void feed_log_shm_destroy(feed_log_shm_t *fl_shm) 
 {
-    ngx_shmtx_destroy(&fl_shm->shmtx);
+    ngx_shmtx_destroy(fl_shm->shmtx_ptr);
     ngx_shm_free(&fl_shm->shm);
 }
 
@@ -638,8 +650,9 @@ static ngx_int_t feed_log_shm_init(feed_log_shm_t *fl_shm)
 
 
     fl_shm->addr = (feed_log_file_summary_shm_t *) fl_shm->shm.addr;
+    fl_shm->shmtx_ptr = &fl_shm->addr->shmtx;
     ngx_memzero(fl_shm->addr, fl_shm->shm.size);
-    if (ngx_shmtx_create(&fl_shm->shmtx, &fl_shm->addr->shmtx_addr,
+    if (ngx_shmtx_create(fl_shm->shmtx_ptr, &fl_shm->addr->shmtx_addr,
                 (u_char *)FEED_LOG_FILE_LOCK) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -1331,11 +1344,11 @@ dir_exists:
 
         if (feed_log_write_file(&flf, line.buf.data, line.buf.len, r) 
                 != NGX_OK) {
-            feed_log_put_file(&flf);
+            feed_log_put_file(&flf, &feed_log_shm);
             return NGX_ERROR;
         }
 
-        feed_log_put_file(&flf);
+        feed_log_put_file(&flf, &feed_log_shm);
     }
 
     return NGX_OK;
