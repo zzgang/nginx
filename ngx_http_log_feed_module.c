@@ -648,7 +648,6 @@ static ngx_int_t feed_log_shm_init(feed_log_shm_t *fl_shm)
         return NGX_ERROR;
     }
 
-
     fl_shm->addr = (feed_log_file_summary_shm_t *) fl_shm->shm.addr;
     fl_shm->shmtx_ptr = &fl_shm->addr->shmtx;
     ngx_memzero(fl_shm->addr, fl_shm->shm.size);
